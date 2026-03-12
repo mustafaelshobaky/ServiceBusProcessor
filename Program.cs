@@ -1,4 +1,5 @@
-﻿using Azure.Messaging.ServiceBus;
+using Azure.Messaging.ServiceBus;
+using Azure.Messaging.ServiceBus.Administration;
 using System.Text.Json;
 
 namespace ServiceBusProcessor;
@@ -14,39 +15,46 @@ class Program
 
     static async Task Main(string[] args)
     {
+        Console.WriteLine("Service Bus Processor");
+        Console.WriteLine("Usage:");
+        Console.WriteLine("  (no args)         - Forward messages from _error queue to destination queue");
+        Console.WriteLine("  purge [hours]     - Purge dead letters older than N hours (default: 24)");
+        Console.WriteLine();
+
+        if (args.Length > 0 && args[0].Equals("purge", StringComparison.OrdinalIgnoreCase))
+        {
+            var cutoffHours = 24;
+            if (args.Length > 1 && int.TryParse(args[1], out var parsedHours))
+                cutoffHours = parsedHours;
+
+            await PurgeDeadLettersAsync(cutoffHours);
+        }
+        else
+        {
+            await ForwardErrorMessagesAsync();
+        }
+    }
+
+    static async Task ForwardErrorMessagesAsync()
+    {
         Console.WriteLine("Service Bus Processor starting...");
 
-        var secretsPath = Path.Combine(AppContext.BaseDirectory, "secrets.json");
-        if (!File.Exists(secretsPath))
-        {
-            Console.WriteLine($"Error: secrets.json not found at {secretsPath}");
-            return;
-        }
-
-        var secretsJson = await File.ReadAllTextAsync(secretsPath);
-        var secrets = JsonSerializer.Deserialize<Secrets>(secretsJson);
-        
-        if (secrets == null || string.IsNullOrEmpty(secrets.SourceConnectionString) || 
-            string.IsNullOrEmpty(secrets.DestinationConnectionString) || 
+        var secrets = LoadSecrets();
+        if (secrets == null || string.IsNullOrEmpty(secrets.SourceConnectionString) ||
+            string.IsNullOrEmpty(secrets.DestinationConnectionString) ||
             string.IsNullOrEmpty(secrets.DestinationQueueName))
         {
             Console.WriteLine("Error: Invalid secrets.json configuration");
             return;
         }
 
-        var sourceConnectionString = secrets.SourceConnectionString;
         var destinationQueueName = secrets.DestinationQueueName;
         var sourceQueueName = $"{destinationQueueName}_error";
-        var destinationConnectionString = secrets.DestinationConnectionString;
 
-        // Create clients for source and destination
-        var sourceClient = new ServiceBusClient(sourceConnectionString);
-        var destinationClient = new ServiceBusClient(destinationConnectionString);
-
-        // Create a sender for the destination queue
+        var sourceClient = new ServiceBusClient(secrets.SourceConnectionString);
+        var destinationClient = new ServiceBusClient(secrets.DestinationConnectionString);
         var sender = destinationClient.CreateSender(destinationQueueName);
 
-        // Create processor options with error handling and concurrency settings
         var processorOptions = new ServiceBusProcessorOptions
         {
             MaxConcurrentCalls = 1,
@@ -54,19 +62,15 @@ class Program
             MaxAutoLockRenewalDuration = TimeSpan.FromMinutes(5)
         };
 
-        // Create the processor
         var processor = sourceClient.CreateProcessor(sourceQueueName, processorOptions);
 
-        // Configure the message handler
         processor.ProcessMessageAsync += async args =>
         {
             try
             {
                 var message = args.Message;
-
                 Console.WriteLine($"Received a message");
 
-                // Create a new message to send to the destination queue
                 var newMessage = new ServiceBusMessage(message.Body)
                 {
                     ContentType = message.ContentType,
@@ -75,28 +79,20 @@ class Program
                     Subject = message.Subject
                 };
 
-                // Copy properties if any
                 foreach (var prop in message.ApplicationProperties)
-                {
                     newMessage.ApplicationProperties.Add(prop.Key, prop.Value);
-                }
 
-                // Send to destination queue
                 await sender.SendMessageAsync(newMessage);
                 Console.WriteLine($"Forwarded message to {destinationQueueName}");
-
-                // Complete the message
                 await args.CompleteMessageAsync(message);
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"Error processing message: {ex.Message}");
-                // Abandon the message to retry later
                 await args.AbandonMessageAsync(args.Message);
             }
         };
 
-        // Configure the error handler
         processor.ProcessErrorAsync += args =>
         {
             Console.WriteLine($"Error occurred: {args.Exception.Message}");
@@ -105,24 +101,120 @@ class Program
 
         try
         {
-            // Start the processor
             await processor.StartProcessingAsync();
             Console.WriteLine("Processing messages. Press any key to stop...");
             Console.ReadKey();
-
-            // Stop the processor
             await processor.StopProcessingAsync();
             Console.WriteLine("Processing stopped");
-
-            // Dispose of clients
-            await processor.DisposeAsync();
-            await sender.DisposeAsync();
-            await sourceClient.DisposeAsync();
-            await destinationClient.DisposeAsync();
         }
         catch (Exception ex)
         {
             Console.WriteLine($"Error running processor: {ex.Message}");
         }
+        finally
+        {
+            await processor.DisposeAsync();
+            await sender.DisposeAsync();
+            await sourceClient.DisposeAsync();
+            await destinationClient.DisposeAsync();
+        }
+    }
+
+    static async Task PurgeDeadLettersAsync(int cutoffHours)
+    {
+        var cutoffTime = DateTimeOffset.UtcNow.AddHours(-cutoffHours);
+        Console.WriteLine("=== Azure Service Bus Dead Letter Purger ===");
+        Console.WriteLine($"Namespace  : curenta-messaging-live");
+        Console.WriteLine($"Cutoff     : {cutoffTime:yyyy-MM-dd HH:mm:ss} UTC (older than {cutoffHours}h)");
+        Console.WriteLine();
+
+        var secrets = LoadSecrets();
+        if (secrets == null || string.IsNullOrEmpty(secrets.SourceConnectionString))
+        {
+            Console.WriteLine("Error: Invalid secrets.json — missing SourceConnectionString");
+            return;
+        }
+
+        var adminClient = new ServiceBusAdministrationClient(secrets.SourceConnectionString);
+        await using var client = new ServiceBusClient(secrets.SourceConnectionString);
+
+        var totalPurged = 0;
+        var totalSkipped = 0;
+        var queuesProcessed = 0;
+
+        await foreach (var props in adminClient.GetQueuesRuntimePropertiesAsync())
+        {
+            if (props.DeadLetterMessageCount == 0)
+                continue;
+
+            queuesProcessed++;
+            Console.WriteLine($"[{queuesProcessed}] {props.Name}");
+            Console.WriteLine($"     DLQ count : {props.DeadLetterMessageCount}");
+
+            var receiver = client.CreateReceiver(props.Name, new ServiceBusReceiverOptions
+            {
+                SubQueue = SubQueue.DeadLetter,
+                ReceiveMode = ServiceBusReceiveMode.PeekLock
+            });
+
+            var queuePurged = 0;
+            var queueSkipped = 0;
+
+            try
+            {
+                while (true)
+                {
+                    var messages = await receiver.ReceiveMessagesAsync(
+                        maxMessages: 100,
+                        maxWaitTime: TimeSpan.FromSeconds(2));
+
+                    if (messages.Count == 0)
+                        break;
+
+                    var oldMessages = messages.Where(m => m.EnqueuedTime < cutoffTime).ToList();
+                    var newMessages = messages.Where(m => m.EnqueuedTime >= cutoffTime).ToList();
+
+                    await Task.WhenAll(oldMessages.Select(m => receiver.CompleteMessageAsync(m)));
+                    await Task.WhenAll(newMessages.Select(m => receiver.AbandonMessageAsync(m)));
+
+                    queuePurged += oldMessages.Count;
+                    totalPurged += oldMessages.Count;
+                    queueSkipped += newMessages.Count;
+                    totalSkipped += newMessages.Count;
+
+                    if (newMessages.Count > 0)
+                        break;
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"     ERROR : {ex.Message}");
+            }
+            finally
+            {
+                await receiver.DisposeAsync();
+            }
+
+            Console.WriteLine($"     Purged: {queuePurged}  |  Kept (< {cutoffHours}h): {queueSkipped}");
+            Console.WriteLine();
+        }
+
+        Console.WriteLine("=== SUMMARY ===");
+        Console.WriteLine($"Queues processed : {queuesProcessed}");
+        Console.WriteLine($"Total purged     : {totalPurged}");
+        Console.WriteLine($"Total kept       : {totalSkipped}");
+    }
+
+    static Secrets? LoadSecrets()
+    {
+        var secretsPath = Path.Combine(AppContext.BaseDirectory, "secrets.json");
+        if (!File.Exists(secretsPath))
+        {
+            Console.WriteLine($"Error: secrets.json not found at {secretsPath}");
+            return null;
+        }
+
+        var secretsJson = File.ReadAllText(secretsPath);
+        return JsonSerializer.Deserialize<Secrets>(secretsJson);
     }
 }

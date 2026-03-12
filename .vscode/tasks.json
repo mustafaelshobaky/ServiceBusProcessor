@@ -47,6 +47,25 @@
                 "${workspaceFolder}/ServiceBusProcessor.csproj"
             ],
             "problemMatcher": "$msCompile"
+        },
+        {
+            "label": "purge dead letters (24h)",
+            "command": "dotnet",
+            "type": "process",
+            "args": [
+                "run",
+                "--project",
+                "${workspaceFolder}/ServiceBusProcessor.csproj",
+                "--",
+                "purge",
+                "24"
+            ],
+            "problemMatcher": "$msCompile",
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated",
+                "clear": true
+            }
         }
     ]
 }
