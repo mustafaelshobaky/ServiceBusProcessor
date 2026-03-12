@@ -174,13 +174,35 @@ class Program
                     var oldMessages = messages.Where(m => m.EnqueuedTime < cutoffTime).ToList();
                     var newMessages = messages.Where(m => m.EnqueuedTime >= cutoffTime).ToList();
 
-                    await Task.WhenAll(oldMessages.Select(m => receiver.CompleteMessageAsync(m)));
-                    await Task.WhenAll(newMessages.Select(m => receiver.AbandonMessageAsync(m)));
+                    var completeTasks = oldMessages.Select(async m =>
+                    {
+                        try
+                        {
+                            await receiver.CompleteMessageAsync(m);
+                            Interlocked.Increment(ref queuePurged);
+                            Interlocked.Increment(ref totalPurged);
+                        }
+                        catch (ServiceBusException ex) when (ex.Reason == ServiceBusFailureReason.MessageLockLost)
+                        {
+                            // lock expired; message will resurface in a future receive batch
+                        }
+                    });
 
-                    queuePurged += oldMessages.Count;
-                    totalPurged += oldMessages.Count;
-                    queueSkipped += newMessages.Count;
-                    totalSkipped += newMessages.Count;
+                    var abandonTasks = newMessages.Select(async m =>
+                    {
+                        try
+                        {
+                            await receiver.AbandonMessageAsync(m);
+                            Interlocked.Increment(ref queueSkipped);
+                            Interlocked.Increment(ref totalSkipped);
+                        }
+                        catch (ServiceBusException ex) when (ex.Reason == ServiceBusFailureReason.MessageLockLost)
+                        {
+                            // lock expired; message will resurface in a future receive batch
+                        }
+                    });
+
+                    await Task.WhenAll(completeTasks.Concat(abandonTasks));
 
                     if (newMessages.Count > 0)
                         break;
